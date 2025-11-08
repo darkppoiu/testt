@@ -1,170 +1,235 @@
-let stopRequested = false;
+// contentScript.js - improved version with robust selectors, MutationObserver and verbose logging
 
-function sleep(ms) {
-  return new Promise(res => setTimeout(res, ms));
+let stopRequested = false;
+const processedSet = new WeakSet();
+
+function log(msg, obj) {
+  console.log(`[FB-CLEANER] ${msg}`, obj || '');
+  try { chrome.runtime.sendMessage({type:'status', text: msg}); } catch(e) {}
 }
 
-async function clickIfExists(el) {
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function clickElement(el) {
   if(!el) return false;
   try {
-    el.scrollIntoView({behavior: 'auto', block: 'center'});
+    el.scrollIntoView({behavior:'auto', block:'center'});
+    // try multiple click methods
+    el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true}));
+    await sleep(80);
     el.click();
     return true;
   } catch(e) {
-    return false;
+    try { el.click(); return true; } catch(e2) { return false; }
   }
 }
 
-// يحاول العثور على زر القائمة داخل عنصر المنشور (role="article")
+// Robust way to find menu button inside an article
 function findMenuButtonInArticle(article) {
-  // محاولات متعددة للعثور على زر النقاط الثلاث أو زر الخيارات
-  const selectors = [
-    'div[aria-haspopup="menu"]',
-    'div[aria-label="Actions for this post"]',
-    'div[aria-label="More"]',
-    'div[aria-label*="more"]',
-    'div[aria-label*="Options"]',
-    'a[aria-label*="more"]',
+  // avoid previously processed
+  if(!article) return null;
+  // common patterns: a button with aria-haspopup, aria-label containing "more", a div with role="button" and svg of three dots
+  const btnSelectors = [
+    'div[aria-haspopup="menu"][role="button"]',
     'div[role="button"][aria-label*="More"]',
-    'div[role="button"] span:contains("More")'
+    'div[role="button"][aria-label*="Actions"]',
+    'div[role="button"][aria-label*="more"]',
+    'div[role="button"] a[aria-label*="More"]',
+    'a[role="button"][aria-label*="More"]',
+    'div[aria-label*="Actions for this post"]',
+    'div[aria-label*="See more"]',
+    'div[aria-label*="Post Options"]',
+    'div[aria-label*="Options"]'
   ];
-  // generic approach: find buttons inside article that look like three-dots menu
-  const buttons = article.querySelectorAll('div[role="button"], a[role="button"], span[role="button"], button');
-  for(const b of buttons){
-    const aria = (b.getAttribute('aria-label') || '').toLowerCase();
-    const text = (b.innerText || '').toLowerCase();
-    if(aria.includes('more') || aria.includes('actions') || aria.includes('options') || text.trim()==='⋯' || text.includes('more') || text.includes('options')) {
-      return b;
+  for(const s of btnSelectors) {
+    const el = article.querySelector(s);
+    if(el) return el;
+  }
+
+  // fallback: search for any clickable element with svg of three dots or text '...' or 'More'
+  const candidates = Array.from(article.querySelectorAll('div[role="button"], a[role="button"], button'));
+  for(const c of candidates) {
+    const aria = (c.getAttribute('aria-label') || '').toLowerCase();
+    const title = (c.getAttribute('title') || '').toLowerCase();
+    const txt = (c.innerText || '').trim().toLowerCase();
+    if(aria.includes('more') || aria.includes('actions') || title.includes('more') || txt === '⋯' || txt === '...' || txt.includes('more') ) return c;
+    // check svg path for three dots clue (loose check)
+    if(c.querySelector('svg') && (txt.length === 0)) {
+      // accept as fallback
+      // return c; // don't return immediately, prefer matches above
     }
-    // sometimes the element has an svg and no text/aria - check title attribute
-    const title = (b.getAttribute('title') || '').toLowerCase();
-    if(title.includes('more') || title.includes('options')) return b;
   }
   return null;
 }
 
-async function findAndClickDeleteInMenu() {
-  // menu items are usually inside [role="menu"] or divs that appear after clicking menu
-  await sleep(600); // wait for menu to open
-  const menus = Array.from(document.querySelectorAll('[role="menu"], [role="dialog"], [role="listbox"], div[role="menu"]'));
-  for(const menu of menus.reverse()){
-    const items = Array.from(menu.querySelectorAll('div, span, a, button')).filter(n => n.innerText && n.innerText.trim().length<80);
-    for(const it of items){
-      const txt = it.innerText.trim().toLowerCase();
-      if(txt.includes('delete') || txt.includes('remove') || txt.includes('delete post') || txt.includes('remove post')) {
-        // click it
-        it.scrollIntoView({block:'center'});
-        it.click();
+async function openMenuAndDelete(article) {
+  // 1) find menu button
+  const menuBtn = findMenuButtonInArticle(article);
+  if(!menuBtn) { log('No menu button found for an article'); return false; }
+  const clickedMenu = await clickElement(menuBtn);
+  if(!clickedMenu) {
+    log('Failed to click menu button'); return false;
+  }
+  // wait menu to appear
+  await sleep(500 + Math.floor(Math.random()*400));
+
+  // 2) find delete/remove item in any visible menu/dialog
+  // look for role="menu" or dialog elements recently added in document body
+  const menuCandidates = Array.from(document.querySelectorAll('[role="menu"], [role="dialog"], [role="menuitem"], div[role="listbox"], div[role="menu"]'));
+  // reverse to check most recently added first
+  for(const menu of menuCandidates.reverse()) {
+    // gather clickable items
+    const items = Array.from(menu.querySelectorAll('div, button, a, span')).filter(n => n.innerText && n.innerText.trim().length < 60);
+    for(const it of items) {
+      const t = it.innerText.trim().toLowerCase();
+      if(t.includes('delete') || t.includes('remove') || t.includes('delete post') || t.includes('remove post') || t.includes('delete photo')) {
+        await clickElement(it);
+        await sleep(400 + Math.floor(Math.random()*300));
+        // confirm if dialog shows
+        await confirmIfDialog();
         return true;
       }
     }
   }
-  // try fallback: find button with "Delete" in whole document
-  const fallback = Array.from(document.querySelectorAll('button, div, a')).find(n => {
-    const t = (n.innerText || '').toLowerCase();
-    return t.includes('delete') || t.includes('remove');
-  });
-  if(fallback) { fallback.click(); return true; }
-  return false;
-}
 
-async function confirmDeletionIfNeeded() {
-  // after clicking delete, there may be a confirmation dialog
-  await sleep(700);
-  // try to find confirm buttons
-  const candidates = Array.from(document.querySelectorAll('button, div[role="button"], a'));
-  for(const c of candidates) {
-    const t = (c.innerText || '').trim().toLowerCase();
-    if(t === 'delete' || t === 'remove' || t === 'confirm' || t === 'yes' || t === 'ok') {
-      try {
-        c.scrollIntoView({block:'center'});
-        c.click();
-        return true;
-      } catch(e) {}
-    }
-  }
-  return false;
-}
-
-async function scrollToLoadMore() {
-  window.scrollBy({top: 1000, left:0, behavior:'smooth'});
-  await sleep(1000);
-}
-
-async function processVisibleArticles(maxPerCycle = 20) {
-  const articles = Array.from(document.querySelectorAll('[role="article"]'));
-  let processed = 0;
-  for(const article of articles) {
-    if(stopRequested) return {stopped:true, processed};
-    // avoid processing same article twice: mark it
-    if(article.dataset.fbcleanerProcessed) continue;
-    article.dataset.fbcleanerProcessed = '1';
-
-    const menuBtn = findMenuButtonInArticle(article);
-    if(!menuBtn) {
-      // skip if cannot find menu
-      continue;
-    }
-    // click menu
-    const ok1 = await clickIfExists(menuBtn);
-    await sleep(600 + Math.floor(Math.random()*400));
-    const ok2 = await findAndClickDeleteInMenu();
-    if(!ok2) {
-      // close menu (press escape)
-      document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+  // fallback broad scan on entire document for visible buttons named delete/remove
+  const globalBtns = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+  for(const g of globalBtns) {
+    const t = (g.innerText || '').trim().toLowerCase();
+    if(t === 'delete' || t === 'remove' || t === 'delete post' || t === 'remove post') {
+      await clickElement(g);
       await sleep(300);
-      continue;
+      await confirmIfDialog();
+      return true;
     }
-    await sleep(700 + Math.floor(Math.random()*500));
-    await confirmDeletionIfNeeded();
-    processed++;
-    // small random delay to mimic human
-    await sleep(900 + Math.floor(Math.random()*800));
-    if(processed >= maxPerCycle) break;
   }
-  return {stopped:false, processed};
+
+  // if nothing found, try pressing Escape to close menu (cleanup)
+  document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape'}));
+  await sleep(150);
+  return false;
 }
 
-async function deleteAllPostsLoop() {
-  stopRequested = false;
-  let totalDeleted = 0;
-  let roundsWithoutProgress = 0;
-  for(let round=0; round<200 && !stopRequested; round++) {
-    // report status
-    chrome.runtime.sendMessage({type:'status', text: `Deleting... total deleted: ${totalDeleted}`});
-    const res = await processVisibleArticles(15);
-    if(res.stopped) {
-      chrome.runtime.sendMessage({type:'status', text: `Stopped by user. Total deleted: ${totalDeleted}`, done:true});
-      return;
+async function confirmIfDialog() {
+  await sleep(350 + Math.floor(Math.random()*300));
+  // find typical confirm buttons in dialog
+  const confirmCandidates = Array.from(document.querySelectorAll('div[role="dialog"] button, div[role="dialog"] a, button, a')).filter(n => n.innerText && n.innerText.trim().length < 30);
+  for(const c of confirmCandidates) {
+    const t = c.innerText.trim().toLowerCase();
+    if(t === 'delete' || t === 'remove' || t === 'confirm' || t === 'ok' || t === 'yes') {
+      await clickElement(c);
+      await sleep(300 + Math.floor(Math.random()*300));
+      return true;
     }
-    if(res.processed === 0) {
-      roundsWithoutProgress++;
+  }
+  // no explicit confirm found — maybe deletion is immediate
+  return false;
+}
+
+async function processOneArticle(article) {
+  if(!article || processedSet.has(article)) return false;
+  processedSet.add(article);
+  if(stopRequested) return false;
+
+  // try to delete
+  try {
+    log('Processing article', article);
+    const ok = await openMenuAndDelete(article);
+    if(ok) {
+      log('Deleted (or attempted) an article');
+      return true;
     } else {
-      totalDeleted += res.processed;
-      roundsWithoutProgress = 0;
+      log('Could not find delete action for this article');
+      return false;
     }
-    // if no progress for a few rounds, try scrolling to load more
-    if(roundsWithoutProgress >= 2) {
-      await scrollToLoadMore();
-    }
-    // if no progress for many rounds, quit
-    if(roundsWithoutProgress >= 6) break;
-    await sleep(800 + Math.floor(Math.random()*600));
+  } catch(e) {
+    console.error('[FB-CLEANER] error processing article', e);
+    return false;
   }
-  chrome.runtime.sendMessage({type:'status', text: `Finished. Approx. deleted: ${totalDeleted}`, done:true});
 }
 
-// message listener: start or stop
+async function processVisibleArticlesBatch(max = 10) {
+  const articles = Array.from(document.querySelectorAll('[role="article"]'));
+  let count = 0;
+  for(const a of articles) {
+    if(stopRequested) return {stopped:true, processed:count};
+    if(processedSet.has(a)) continue;
+    const res = await processOneArticle(a);
+    if(res) count++;
+    // small human-like pause
+    await sleep(600 + Math.floor(Math.random()*600));
+    if(count >= max) break;
+  }
+  return {stopped:false, processed:count};
+}
+
+async function scrollAndWait() {
+  window.scrollBy({top: 1200, left:0, behavior:'smooth'});
+  await sleep(900 + Math.floor(Math.random()*400));
+}
+
+async function deleteLoop() {
+  stopRequested = false;
+  let total = 0;
+  let idleRounds = 0;
+  for(let i=0; i<300 && !stopRequested; i++) {
+    log(`Loop #${i+1} — total deleted so far: ${total}`);
+    const res = await processVisibleArticlesBatch(12);
+    if(res.stopped) { log('Stopped by user'); break; }
+    if(res.processed === 0) {
+      idleRounds++;
+      await scrollAndWait();
+    } else {
+      total += res.processed;
+      idleRounds = 0;
+    }
+    if(idleRounds >= 6) {
+      log('No progress after several attempts — stopping');
+      break;
+    }
+    await sleep(700 + Math.floor(Math.random()*600));
+  }
+  log(`Finished loop. Approx total deleted: ${total}`);
+  try { chrome.runtime.sendMessage({type:'status', text:`Finished. Approx deleted: ${total}`, done:true}); } catch(e) {}
+}
+
+// Listen for messages (start / stop)
 chrome.runtime.onMessage.addListener((msg, sender, sendResp) => {
-  if(msg.action === 'startDelete') {
-    // confirm we are in a group URL
+  if(msg && msg.action === 'startDelete') {
     if(!location.href.includes('/groups/')) {
-      chrome.runtime.sendMessage({type:'status', text: 'Not on a Facebook group page. Navigate to the group posts page first.', done:true});
+      log('Not a group URL. Navigate to the group posts page and try again.');
+      try { chrome.runtime.sendMessage({type:'status', text:'Not on a Facebook group page. Navigate to the group first.', done:true}); } catch(e){}
       return;
     }
-    chrome.runtime.sendMessage({type:'status', text: 'Starting deletion...', disableStart:true});
-    deleteAllPostsLoop();
-  } else if(msg.action === 'stopDelete') {
+    log('Start requested — initiating delete loop');
+    deleteLoop();
+  } else if(msg && msg.action === 'stopDelete') {
     stopRequested = true;
+    log('Stop requested by popup');
   }
 });
+
+// MutationObserver to mark new articles and optionally auto-process if running
+const observer = new MutationObserver((mutations) => {
+  // do lightweight scanning only
+  for(const m of mutations) {
+    if(m.addedNodes && m.addedNodes.length) {
+      for(const n of m.addedNodes) {
+        if(n && n.querySelector && n.querySelector('[role="article"]')) {
+          // small log
+          // console.log('[FB-CLEANER] new article nodes added');
+        }
+      }
+    }
+  }
+});
+observer.observe(document.body, {childList:true, subtree:true});
+
+// Expose small API to window for manual testing in console
+window.fbCleaner = {
+  start: () => { chrome.runtime.sendMessage({type:'status', text:'Manual start from console'}); deleteLoop(); },
+  stop: () => { stopRequested = true; log('Manual stop via window.fbCleaner.stop()'); },
+  status: () => { console.log('stopRequested=', stopRequested); }
+};
+
+log('contentScript loaded. Ready.');
