@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "FB Group Bulk Deleter",
+  "version": "1.0",
+  "description": "Delete all posts in a Facebook group (Admin only). Use at your own risk.",
+  "permissions": ["scripting", "activeTab", "storage"],
+  "host_permissions": ["https://www.facebook.com/*"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "FB Group Bulk Deleter"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.facebook.com/groups/*", "https://www.facebook.com/groups/*/*"],
+      "js": ["contentScript.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
